@@ -1,0 +1,164 @@
+#!/usr/bin/env -S sh -c 'exec "$(dirname "$0")/.venv/bin/python" "$0" "$@"'
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""fn-words - find a Freenet website contract key that STARTS WITH ANY WORD
+from a list, rather than one chosen word.
+
+Why this is so much cheaper: hunting one specific 7-char word is ~38e12 tries
+(2.4 days at 185 Mkey/s). Accepting any of a few thousand seven-plus-letter
+words cuts that by roughly the number of words, for a result that is arguably
+nicer, since you get a real English word either way. The script prints the
+exact expected count for the list and length filter you pick.
+
+    contract_id = blake3( container_code_hash[32] || ed25519_pubkey[32] )
+
+Each word maps to one or two numeric RANGES over the raw 32-byte id (two
+because a 32-byte value base58-encodes to either 43 or 44 characters, and the
+same prefix sits at a different magnitude in each). Ranges are sorted and
+MERGED into a disjoint set before going to the GPU: with overlapping ranges a
+binary search can miss an enclosing range (a 6-letter word's range contains
+every 7-letter word sharing that prefix) and we would report a miss on a real
+hit. Merging costs us nothing because any word counts.
+
+Usage:  ./fn-words --min-len 7 [--words FILE]
+"""
+import argparse
+import base58
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B58SET = set(B58)
+# Website container contract code hash; see fn-vanity for where it comes from.
+CONTAINER = "7EBvjNgTAteeJBKE3TRHq9vSiDPi8Ex7aKWZfhwtf13r"
+TOP = (1 << 256) - 1
+# Values below 2^248 have a leading zero byte, which base58 renders as an extra
+# leading '1', so they never start with a non-'1' prefix.
+FLOOR = 1 << 248
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GPU = os.path.join(HERE, "cuda", "website-vanity-gpu")
+
+
+def run_gpu(args):
+    """Run the CUDA binary, echoing its output live (progress lines use \\r)
+    while keeping a copy to parse. Returns (returncode, stdout_text)."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE)
+    chunks = []
+
+    def pump():
+        while True:
+            b = proc.stdout.read1(4096)
+            if not b:
+                return
+            chunks.append(b)
+            sys.stdout.write(b.decode(errors="replace"))
+            sys.stdout.flush()
+
+    try:
+        pump()
+    except KeyboardInterrupt:
+        # Ctrl-C reaches the GPU process too; let it print its summary.
+        pump()
+    return proc.wait(), b"".join(chunks).decode(errors="replace")
+
+
+def word_ranges(word):
+    """One or two (lo, hi) 32-byte-int ranges whose base58 starts with `word`."""
+    n = 0
+    for ch in word:
+        n = n * 58 + B58.index(ch)
+    out = []
+    for total in (43, 44):
+        if total < len(word):
+            continue
+        pad = total - len(word)
+        lo = n * (58 ** pad)
+        hi = (n + 1) * (58 ** pad) - 1
+        lo, hi = max(lo, FLOOR), min(hi, TOP)
+        if lo > hi:
+            continue
+        out.append((lo, hi))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="GPU search for a website contract key starting with any listed word")
+    ap.add_argument("--min-len", type=int, default=7)
+    ap.add_argument("--max-len", type=int, default=99)
+    ap.add_argument("--words", default=os.path.join(HERE, "words-b58.txt"))
+    args = ap.parse_args()
+
+    raw = [w.strip() for w in open(args.words) if w.strip()]
+    words = [
+        w for w in raw
+        if args.min_len <= len(w) <= args.max_len
+        and all(c in B58SET for c in w)
+        and not w.startswith("1")
+    ]
+    if not words:
+        raise SystemExit("no usable words after filtering")
+
+    spans = []
+    for w in words:
+        spans.extend(word_ranges(w))
+    spans.sort()
+
+    merged = []
+    for lo, hi in spans:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+
+    covered = sum(hi - lo + 1 for lo, hi in merged)
+    expected = (1 << 256) // covered
+    secs = expected / 185e6
+    print(f"words         : {len(words)} (len {args.min_len}..{args.max_len}, base58-clean)")
+    print(f"ranges        : {len(spans)} -> {len(merged)} after merge")
+    print(f"expected tries: ~{expected:,}   (~{secs:.1f}s at 185 Mkey/s)")
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        f.write(struct.pack("<I", len(merged)))
+        for lo, hi in merged:
+            f.write(lo.to_bytes(32, "big"))
+            f.write(hi.to_bytes(32, "big"))
+        path = f.name
+
+    try:
+        code_hex = base58.b58decode(CONTAINER).hex()
+        rc, out = run_gpu([GPU, code_hex, path])
+        print()
+    finally:
+        os.unlink(path)
+
+    seed = pub = cid = None
+    for line in out.splitlines():
+        if "Private key (seed)" in line:
+            seed = line.split(":", 1)[1].strip()
+        elif "Public key" in line:
+            pub = line.split(":", 1)[1].strip()
+        elif line.startswith("contract_id_hex"):
+            cid = line.split("=", 1)[1].strip()
+    if not (seed and pub and cid):
+        raise SystemExit(rc or 1)
+
+    enc = base58.b58encode(bytes.fromhex(cid)).decode()
+    # Independent host check: name the word, never trust the kernel's verdict.
+    hits = sorted((w for w in words if enc.startswith(w)), key=len, reverse=True)
+    if not hits:
+        raise SystemExit(f"BUG: {enc} matched no word in the list")
+
+    print(f"contract key : {enc}")
+    print(f"matched word : {hits[0]}" + (f"   (also {', '.join(hits[1:])})" if len(hits) > 1 else ""))
+    print()
+    print("--- ~/.config/freenet/website-keys/<name>.toml ---")
+    print("[keys]")
+    print(f'signing_key = "{seed}"')
+    print(f'verifying_key = "{pub}"')
+
+
+if __name__ == "__main__":
+    main()

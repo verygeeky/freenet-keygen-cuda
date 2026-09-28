@@ -1,0 +1,16 @@
+# Grinder output and logs can contain private seeds. Never commit them.
+*.log
+*.key
+*.seed
+*identity*.json
+
+# Build outputs
+target/
+cuda/website-vanity-gpu
+cuda/test_blake3
+*.o
+
+# Python
+.venv/
+__pycache__/
+*.pyc

@@ -1,0 +1,153 @@
+#!/usr/bin/env -S sh -c 'exec "$(dirname "$0")/.venv/bin/python" "$0" "$@"'
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""fn-vanity - GPU vanity search for a Freenet website contract key.
+
+    contract_id = blake3( container_code_hash[32] || ed25519_pubkey[32] )
+
+The container contract is identical for every published website, so its code
+hash is a constant and only the pubkey varies. This wrapper turns a base58
+prefix into one or two numeric RANGES over the raw 32-byte id and hands them
+to the CUDA kernel, which then does 32-byte compares per candidate instead of
+a base58 encode.
+
+WHY THE EXPECTED COUNT IS NOT 58**n:
+base58 of a 32-byte value is 43 or 44 characters, so an n-char prefix covers
+only part of the encoding space. 'frost' is ~1/11.3e9, not 1/58**5 = 1/656e6,
+about 17x worse. The real figure is computed below from the actual ranges.
+
+Usage:  ./fn-vanity frost
+"""
+import base58
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+TOP = (1 << 256) - 1
+# Values below 2^248 have a leading zero byte, which base58 renders as an extra
+# leading '1', so they never start with a non-'1' prefix.
+FLOOR = 1 << 248
+
+# Website container contract code hash: blake3 of the website_contract.wasm
+# that fdev embeds (freenet-core, crates/fdev/resources/website_contract.wasm).
+# If fdev ships a new container, this changes and so does every contract key.
+CONTAINER = "7EBvjNgTAteeJBKE3TRHq9vSiDPi8Ex7aKWZfhwtf13r"
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GPU = os.path.join(HERE, "cuda", "website-vanity-gpu")
+
+
+def run_gpu(args):
+    """Run the CUDA binary, echoing its output live (progress lines use \\r)
+    while keeping a copy to parse. Returns (returncode, stdout_text)."""
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE)
+    chunks = []
+
+    def pump():
+        while True:
+            b = proc.stdout.read1(4096)
+            if not b:
+                return
+            chunks.append(b)
+            sys.stdout.write(b.decode(errors="replace"))
+            sys.stdout.flush()
+
+    try:
+        pump()
+    except KeyboardInterrupt:
+        # Ctrl-C reaches the GPU process too; let it print its summary.
+        pump()
+    return proc.wait(), b"".join(chunks).decode(errors="replace")
+
+
+def prefix_ranges(prefix: str):
+    """(lo, hi) 32-byte-int ranges whose base58 encoding starts with `prefix`.
+
+    A 32-byte value encodes to 43 or 44 characters and the same prefix sits at
+    a different magnitude in each, so there can be two disjoint ranges. They
+    must stay separate: spanning them with one [min, max] range would accept
+    ids that do not start with the prefix.
+    """
+    if not prefix or prefix[0] == "1":
+        raise SystemExit(
+            "a leading '1' in base58 stands for a zero byte; such prefixes are not supported."
+        )
+    n = 0
+    for ch in prefix:
+        if ch not in B58:
+            raise SystemExit(
+                f"{ch!r} is not in the base58 alphabet (it has no 0, O, I or l)."
+            )
+        n = n * 58 + B58.index(ch)
+    out = []
+    for total in (43, 44):
+        if total < len(prefix):
+            continue
+        pad = total - len(prefix)
+        lo = n * (58 ** pad)
+        hi = (n + 1) * (58 ** pad) - 1
+        lo, hi = max(lo, FLOOR), min(hi, TOP)
+        if lo > hi:
+            continue
+        out.append((lo, hi))
+    if not out:
+        raise SystemExit(
+            f"prefix {prefix!r} is unreachable: no 32-byte value encodes to it."
+        )
+    return sorted(out)
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: fn-vanity <base58-prefix>")
+    prefix = sys.argv[1]
+    ranges = prefix_ranges(prefix)
+    expected = (1 << 256) // sum(hi - lo + 1 for lo, hi in ranges)
+
+    print(f"prefix        : {prefix!r}")
+    print(f"container     : {CONTAINER}")
+    print(f"expected tries: ~{expected:,}")
+
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        f.write(struct.pack("<I", len(ranges)))
+        for lo, hi in ranges:
+            f.write(lo.to_bytes(32, "big"))
+            f.write(hi.to_bytes(32, "big"))
+        path = f.name
+
+    try:
+        code_hex = base58.b58decode(CONTAINER).hex()
+        rc, out = run_gpu([GPU, code_hex, path])
+    finally:
+        os.unlink(path)
+    print()
+
+    seed = pub = cid = None
+    for line in out.splitlines():
+        if "Private key (seed)" in line:
+            seed = line.split(":", 1)[1].strip()
+        elif "Public key" in line:
+            pub = line.split(":", 1)[1].strip()
+        elif line.startswith("contract_id_hex"):
+            cid = line.split("=", 1)[1].strip()
+
+    if not (seed and pub and cid):
+        raise SystemExit(rc or 1)
+
+    enc = base58.b58encode(bytes.fromhex(cid)).decode()
+    # Independent host-side check: never report success on the kernel's word.
+    if not enc.startswith(prefix):
+        raise SystemExit(f"BUG: kernel returned {enc}, which does not start with {prefix!r}")
+
+    print(f"contract key : {enc}")
+    print()
+    print("--- ~/.config/freenet/website-keys/<name>.toml ---")
+    print("[keys]")
+    print(f'signing_key = "{seed}"')
+    print(f'verifying_key = "{pub}"')
+
+
+if __name__ == "__main__":
+    main()
